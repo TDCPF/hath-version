@@ -1,0 +1,75 @@
+name: 每日更新版本資訊並部署到 GitHub Pages
+
+# 論壇在 Cloudflare managed challenge 後面,以 FlareSolverr(真 Chrome)作為唯一取得途徑。
+# 只存資訊(api/*.json),不下載任何 client 檔案。有變動才 commit 回 main 並部署。
+on:
+  schedule:
+    - cron: '17 21 * * *'   # 每天一次(UTC 21:17),避開整點
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  update:
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    concurrency: {group: update, cancel-in-progress: false}
+    permissions:
+      contents: write
+    outputs:
+      changed: ${{ steps.commit.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v5
+      - run: python3 tests/test_parse.py
+
+      - name: 啟動 FlareSolverr
+        run: |
+          docker run -d --name flaresolverr -p 8191:8191 ghcr.io/flaresolverr/flaresolverr:latest
+          for i in $(seq 90); do curl -sf http://localhost:8191/ >/dev/null && { echo "就緒(${i}s)"; exit 0; }; sleep 1; done
+          docker logs flaresolverr | tail -20; exit 1
+
+      - name: 抓取並解析
+        env:
+          FLARESOLVERR_URL: http://localhost:8191/v1
+        run: python3 scripts/update.py api
+
+      - name: 有變動才 commit 回 main
+        id: commit
+        run: |
+          if git diff --quiet -- api && [ -z "$(git ls-files --others --exclude-standard api)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add api
+          git commit -q -m "更新版本資訊 $(date -u '+%Y-%m-%d')"
+          git pull -q --rebase
+          git push -q
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: update
+    if: >-
+      always() && (github.event_name == 'push' || needs.update.outputs.changed == 'true'
+      || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    concurrency: {group: pages, cancel-in-progress: false}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - run: |
+          mkdir -p _site && cp -r index.html api _site/ && touch _site/.nojekyll
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
